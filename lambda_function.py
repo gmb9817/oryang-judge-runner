@@ -5,11 +5,14 @@ import time
 import resource
 import os
 import signal
+import stat
 
 def handler(event, context):
     """
-    AWS Lambda Online Judge Handler (Optimized)
-    기능: 파일 기반 I/O를 통한 대용량 입력 처리, C++17 지원, 안정성 강화
+    AWS Lambda Online Judge Handler (Final Fix)
+    - Fix: -static 옵션 제거 (AL2023 호환성 문제 해결)
+    - Fix: 실행 권한(chmod +x) 명시적 부여
+    - Fix: 환경 변수(HOME) 설정
     """
     
     # 1. 입력 데이터 파싱
@@ -19,88 +22,98 @@ def handler(event, context):
         body = event
 
     code = body.get('code', '')
-    language = body.get('language', 'python') # 'python' or 'cpp'
+    # [방어 코드] 눈에 안 보이는 특수문자 제거
+    if code:
+        code = code.replace('\u00a0', ' ').replace('\u3000', ' ')
+
+    language = body.get('language', 'python') 
     input_data = body.get('input', '')
-    
-    # 타임아웃 설정 (기본 2초 -> 안전하게 처리)
     time_limit = body.get('time_limit', 2) 
 
     result = {
         'output': '', 
         'status': 'success',
-        'time': 0,    # ms
-        'memory': 0   # KB
+        'time': 0,    
+        'memory': 0   
     }
 
-    # /tmp 디렉토리 경로 설정
+    # 경로 설정
     source_path = ""
     exe_path = ""
-    input_file_path = "/tmp/input.txt" # 입력을 저장할 파일 경로
+    input_file_path = "/tmp/input.txt"
+
+    # [중요] C++ 컴파일러를 위한 환경 변수 설정
+    # HOME 변수가 없으면 g++이 가끔 경고를 뱉거나 실패할 수 있음
+    env = os.environ.copy()
+    env['HOME'] = '/tmp'
 
     try:
-        # ==========================================
-        # [최적화] 입력 데이터를 파일로 저장
-        # 메모리 절약 및 파이프(Pipe) 데드락 방지
-        # ==========================================
+        # 입력 데이터 저장
         with open(input_file_path, "w") as f:
             f.write(input_data)
 
+        run_cmd = []
+
         # ==========================================
-        # 2. 컴파일 단계 (C++만 해당)
+        # 2. 언어별 처리
         # ==========================================
-        if language == 'cpp':
+        if language == 'python':
+            source_path = "/tmp/solution.py"
+            with open(source_path, "w") as f:
+                f.write(code)
+            run_cmd = [sys.executable, source_path]
+
+        elif language == 'cpp':
             source_path = "/tmp/solution.cpp"
             exe_path = "/tmp/solution"
             
             with open(source_path, "w") as f:
                 f.write(code)
 
+            # [핵심 수정 1] -static 제거 (환경 호환성 해결)
             compile_cmd = [
-                "g++", source_path, 
+                "/usr/bin/g++", source_path,  # 절대 경로 사용 권장
                 "-o", exe_path, 
                 "-O2", 
-                "-static",
                 "-Wall", 
                 "-lm", 
-                "-std=gnu++17" # C++17 지원
+                "-std=gnu++17" 
             ]
             
             compile_proc = subprocess.run(
                 compile_cmd,
                 capture_output=True,
-                text=True
+                text=True,
+                env=env # 환경 변수 주입
             )
 
             if compile_proc.returncode != 0:
                 result['status'] = 'compile_error'
                 result['output'] = compile_proc.stderr
                 return {'statusCode': 200, 'body': json.dumps(result)}
+            
+            # [핵심 수정 2] 실행 권한 부여
+            if os.path.exists(exe_path):
+                os.chmod(exe_path, os.stat(exe_path).st_mode | stat.S_IEXEC)
 
-        # ==========================================
-        # 3. 실행 단계 (파일 스트림 사용)
-        # ==========================================
-        
-        run_cmd = []
-        if language == 'python':
-            run_cmd = [sys.executable, "-c", code]
-        elif language == 'cpp':
             run_cmd = [exe_path]
 
+        # ==========================================
+        # 3. 실행 단계
+        # ==========================================
         start_time = time.time()
         
         try:
-            # [핵심 수정] stdin=infile을 사용하여 파이프 대신 파일 내용을 직접 주입
             with open(input_file_path, "r") as infile:
                 process = subprocess.run(
                     run_cmd,
-                    stdin=infile,        # input=input_data 대신 파일 스트림 사용
-                    capture_output=True, # stdout/stderr 캡처
+                    stdin=infile,
+                    capture_output=True,
                     text=True,
-                    timeout=time_limit
+                    timeout=time_limit,
+                    env=env # 환경 변수 주입
                 )
-            
             is_timeout = False
-            
         except subprocess.TimeoutExpired:
             is_timeout = True
             process = None
@@ -110,50 +123,35 @@ def handler(event, context):
         # ==========================================
         # 4. 결과 분석
         # ==========================================
-
         if is_timeout:
             result['status'] = 'timeout'
             result['output'] = 'Time Limit Exceeded'
             result['time'] = int(time_limit * 1000)
         else:
             result['time'] = int((end_time - start_time) * 1000)
-            
-            # 메모리 측정 (최대 RSS)
             usage = resource.getrusage(resource.RUSAGE_CHILDREN)
             result['memory'] = int(usage.ru_maxrss) 
 
             if process.returncode != 0:
                 result['status'] = 'runtime_error'
-                
                 if process.stderr:
-                    err_msg = process.stderr.strip()
-                    if len(err_msg) > 1024:
-                        err_msg = err_msg[:1024] + "\n... (Error truncated)"
-                    result['output'] = err_msg
+                    result['output'] = process.stderr[:1024]
                 else:
-                    # Signal 분석
+                    # 시그널 분석
                     code = -process.returncode
-                    if code == signal.SIGSEGV:
-                        result['output'] = "Runtime Error (Segmentation Fault)"
-                    elif code == signal.SIGFPE:
-                        result['output'] = "Runtime Error (Floating Point Exception)"
-                    elif code == signal.SIGABRT:
-                        result['output'] = "Runtime Error (Aborted)"
-                    else:
-                        result['output'] = f"Runtime Error (Exit Code: {process.returncode})"
+                    if code == signal.SIGSEGV: result['output'] = "Runtime Error (Segmentation Fault)"
+                    elif code == signal.SIGFPE: result['output'] = "Runtime Error (Floating Point Exception)"
+                    elif code == signal.SIGABRT: result['output'] = "Runtime Error (Aborted)"
+                    else: result['output'] = f"Runtime Error (Exit Code: {process.returncode})"
             else:
-                output_str = process.stdout.strip() if process.stdout else ""
-                if len(output_str) > 65535:
-                    output_str = output_str[:65535] + "\n... (Output truncated)"
-                result['output'] = output_str
+                out = process.stdout.strip() if process.stdout else ""
+                result['output'] = out[:65535]
 
     except Exception as e:
         result['status'] = 'server_error'
         result['output'] = f"System Error: {str(e)}"
     
-    # ==========================================
-    # 5. 청소 (Clean up)
-    # ==========================================
+    # 청소
     for path in [exe_path, source_path, input_file_path]:
         if path and os.path.exists(path):
             try: os.remove(path)
