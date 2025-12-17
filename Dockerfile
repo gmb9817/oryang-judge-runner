@@ -1,11 +1,12 @@
 FROM public.ecr.aws/lambda/python:3.11
 
-RUN dnf update -y && \
-    dnf install -y gcc-c++ make binutils glibc-devel libstdc++-devel && \
-    dnf clean all
+# gcc, g++ 설치 (필수!)
+RUN yum update -y && \
+    yum install -y gcc gcc-c++ && \
+    yum clean all
 
-WORKDIR ${LAMBDA_TASK_ROOT}
+# 코드 복사
+COPY lambda_function.py ${LAMBDA_TASK_ROOT}
 
-COPY lambda_function.py .
-
-CMD [ "lambda_function.handler" ]
+# 핸들러 설정
+CMD [ "lambda_function.lambda_handler" ]
