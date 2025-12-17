@@ -12,9 +12,9 @@ BUCKET_NAME = os.environ.get('S3_BUCKET_NAME', 'oryang-judge-tc')
 
 def lambda_handler(event, context):
     try:
-        # --- 1. 파라미터 파싱 ---
+        # 1. 파라미터 파싱
         code = event.get('code', '')
-        language = event.get('language', 'c')
+        language = event.get('language', 'c').lower()
         s3_key = event.get('s3_key')
         base_time_limit = float(event.get('time_limit', 1.0))
         memory_limit_mb = int(event.get('memory_limit', 128))
@@ -23,105 +23,82 @@ def lambda_handler(event, context):
         output_file_path = '/tmp/stdout.txt'
         error_file_path = '/tmp/stderr.txt'
         
-        # --- 2. 입력 데이터 준비 ---
+        # 2. 입력 데이터 준비 (S3에서 직접 다운로드하여 메모리 보호)
         if s3_key:
             s3.download_file(BUCKET_NAME, s3_key, input_file_path)
         else:
-            with open(input_file_path, 'w', encoding='utf-8') as f:
-                f.write(event.get('input', ''))
+            with open(input_file_path, 'wb') as f: # 바이너리 모드로 저장
+                f.write(event.get('input', '').encode('utf-8'))
 
-        # --- 3. 실행 커맨드 설정 ---
+        # 3. 실행 환경 및 커맨드 설정
         run_cmd = []
-        # 메모리: 설정값 * 2 + 64MB 여유 (Bytes 단위 변환)
-        limit_as_bytes = (memory_limit_mb * 2 + 64) * 1024 * 1024
-        
-        # 시간: Python은 3배+2초 여유, C/C++은 그대로
-        actual_time_limit = base_time_limit
-        if language in ['python', 'py']:
-            actual_time_limit = (base_time_limit * 3.0) + 2.0
-        
         if language in ['python', 'py']:
             file_name = '/tmp/solution.py'
-            # Python 재귀 제한만 해제 (시스템 스택은 건드리지 않음)
             with open(file_name, 'w', encoding='utf-8') as f:
                 f.write("import sys; sys.setrecursionlimit(10**6);\n" + code)
             run_cmd = [sys.executable, '-u', file_name]
-            
-        elif language == 'c':
-            file_name = '/tmp/solution.c'
+        elif language in ['c', 'cpp']:
+            ext = 'c' if language == 'c' else 'cpp'
+            compiler = 'gcc' if language == 'c' else 'g++'
+            file_name = f'/tmp/solution.{ext}'
             exe = '/tmp/solution'
             with open(file_name, 'w', encoding='utf-8') as f: f.write(code)
-            # 컴파일
-            subprocess.run(['gcc', '-O2', file_name, '-o', exe], check=True)
-            run_cmd = [exe]
-            
-        elif language == 'cpp':
-            file_name = '/tmp/solution.cpp'
-            exe = '/tmp/solution'
-            with open(file_name, 'w', encoding='utf-8') as f: f.write(code)
-            # 컴파일
-            subprocess.run(['g++', '-O2', file_name, '-o', exe], check=True)
+            # 컴파일 (컴파일 단계는 메모리 제한을 크게 받지 않음)
+            subprocess.run([compiler, '-O2', file_name, '-o', exe], check=True, capture_output=True)
             run_cmd = [exe]
 
-        # --- 4. 리소스 제한 함수 (안전 모드) ---
+        # 4. 리소스 제한 (RLIMIT_AS 대신 물리 메모리 관리에 집중)
         def set_limits():
-            try:
-                # ★ [핵심 수정] 스택 제한 코드 삭제 (AWS Lambda에서 금지됨)
-                # 메모리 제한만 설정 (Bytes 단위)
-                if limit_as_bytes > 0:
-                    resource.setrlimit(resource.RLIMIT_AS, (limit_as_bytes, limit_as_bytes))
-            except Exception:
-                sys.exit(100) # 설정 실패 시 종료 코드 100
+            # 가상 메모리(AS) 대신 실제 데이터 영역(DATA)과 파일 크기(FSIZE) 제한
+            # 사용자 프로그램이 50MB 이상의 파일을 생성하지 못하게 제한
+            max_file_size = 50 * 1024 * 1024 
+            resource.setrlimit(resource.RLIMIT_FSIZE, (max_file_size, max_file_size))
+            # 메모리 제한은 넉넉하게 주되, 람다 전체 용량을 넘지 않게 설정
+            limit_bytes = memory_limit_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_DATA, (limit_bytes, limit_bytes))
 
-        # --- 5. 실행 ---
+        # 5. 실행 (핵심: text=False로 설정하여 바이너리 스트리밍)
         start_time = time.time()
         
-        with open(input_file_path, 'r') as infile, \
-             open(output_file_path, 'w') as outfile, \
-             open(error_file_path, 'w') as errfile:
+        with open(input_file_path, 'rb') as infile, \
+             open(output_file_path, 'wb') as outfile, \
+             open(error_file_path, 'wb') as errfile:
             
             process = subprocess.Popen(
                 run_cmd,
                 stdin=infile,
                 stdout=outfile,
                 stderr=errfile,
-                text=True,
+                text=False, # 바이너리 모드로 전환 (메모리 복사 방지)
                 preexec_fn=set_limits
             )
             
             try:
-                process.wait(timeout=actual_time_limit)
+                # 실제 타임아웃 계산 (여유시간 포함)
+                actual_timeout = (base_time_limit * 3 + 2) if 'py' in language else base_time_limit
+                process.wait(timeout=actual_timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
-                return {'statusCode': 200, 'body': json.dumps({'status': 'timeout', 'time': actual_time_limit * 1000})}
+                return {'statusCode': 200, 'body': json.dumps({'status': 'timeout'})}
 
         time_used = int((time.time() - start_time) * 1000)
         
-        # 출력 읽기
+        # 6. 결과 파일 읽기 (제한된 크기만 메모리에 로드)
         output_data = ""
         if os.path.exists(output_file_path):
-            with open(output_file_path, 'r', errors='ignore') as f: output_data = f.read(2048)
+            with open(output_file_path, 'rb') as f:
+                output_data = f.read(1024 * 1024).decode('utf-8', errors='ignore').strip()
             
         stderr_data = ""
         if os.path.exists(error_file_path):
-            with open(error_file_path, 'r', errors='ignore') as f: stderr_data = f.read(1024)
+            with open(error_file_path, 'rb') as f:
+                stderr_data = f.read(2048).decode('utf-8', errors='ignore')
 
-        # 결과 처리
+        # 7. 종료 상태 확인
         if process.returncode != 0:
             status = 'runtime_error'
-            if process.returncode == -9: status = 'memory_limit_exceeded' # SIGKILL
-            if process.returncode == 100: stderr_data += " [System] Resource Limit Failed"
-            
-            return {
-                'statusCode': 200, 
-                'body': json.dumps({'status': status, 'output': stderr_data})
-            }
-            
-        # 시간 초과 2차 체크 (Python 여유 시간 제외하고 원본 시간과 비교)
-        # Python은 시간이 넉넉하므로, 실제 사용 시간이 '원본 제한'을 넘었는지 확인
-        display_time_limit = base_time_limit * 1000
-        if language in ['python', 'py'] and time_used > display_time_limit:
-             return {'statusCode': 200, 'body': json.dumps({'status': 'timeout', 'time': time_used})}
+            if process.returncode == -9: status = 'memory_limit_exceeded'
+            return {'statusCode': 200, 'body': json.dumps({'status': status, 'output': stderr_data})}
 
         return {
             'statusCode': 200,
@@ -134,8 +111,4 @@ def lambda_handler(event, context):
         }
 
     except Exception:
-        # 시스템 에러 발생 시 상세 로그 반환
-        return {
-            'statusCode': 200, 
-            'body': json.dumps({'status': 'judge_error', 'output': traceback.format_exc()})
-        }
+        return {'statusCode': 200, 'body': json.dumps({'status': 'judge_error', 'output': traceback.format_exc()})}
